@@ -18,8 +18,34 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"sync"
 	"time"
 )
+
+// A lockable net.Conn.
+type connection struct {
+	sync.Mutex
+	startWrite chan bool
+	netConn    net.Conn
+}
+
+// primeConnection prepares and returns a connection structure pointer.
+func primeConnection() *connection {
+	conn := connection{}
+	conn.startWrite = make(chan bool)
+	return &conn
+}
+
+// existsConnection only checks if this graphd instance has non-nil connection (net.Conn) with a
+// graph database.  The connection itself may be stale, but any failed writes will trigger a Redial.
+// Must hold connection lock to invoke.
+func (c *connection) existsConnection() bool {
+	if c.netConn == nil {
+		return false
+	}
+
+	return true
+}
 
 // Connections are sent/received on res.  awaitingConn is used as a mutex.
 type connChan struct {
@@ -73,20 +99,11 @@ func (g *graphd) dial(url *url.URL, timeout time.Duration, connCh connChan) {
 	}
 }
 
-// isConnected checks if this graphd instance is connected to a graphd database.
-// TODO: Currently only a stub.  True case needs a write check (ie. "status()").
-func (g *graphd) isConnected() bool {
-	if g.conn == nil {
-		return false
-	}
-
-	return true
-}
-
 // Dial a graphd database.  Dial will attempt to connect to all URLs found in the URLs list associated
 // with this graphd instance, retaining the first successful connection.  On failure, an appropriate
 // error code is returned.  If an acquired connection is already present and valid, Dial returns nil.
 // Timeout is specified in seconds.  A timeout of 0 is treated as no timeout.
+// Dial ensures only one thread is dialing at a time.
 func (g *graphd) Dial(t int) error {
 	// Set timeout if t > 0, otherwise use the zero value (0s) which signals no timeout.
 	var timeout time.Duration
@@ -101,9 +118,13 @@ func (g *graphd) Dial(t int) error {
 		return errors.New(errStr)
 	}
 
+	// Only one thread dialing at a time.
+	g.conn.Lock()
+	defer g.conn.Unlock()
+
 	// If already connected, return success.
-	if g.isConnected() {
-		g.LogDebugf("already connected to %v", g.conn.RemoteAddr())
+	if g.conn.existsConnection() {
+		g.LogDebugf("already connected to %v", g.conn.netConn.RemoteAddr())
 		return nil
 	}
 
@@ -131,7 +152,7 @@ func (g *graphd) Dial(t int) error {
 
 		// Acquired a valid connection.  Set connection instance.
 		g.LogDebugf("successfully connected to %v", conn.RemoteAddr())
-		g.conn = conn
+		g.conn.netConn = conn
 
 		// Signal dialers that we've acquired a connection.
 		close(connCh.awaitingConn)
@@ -140,7 +161,7 @@ func (g *graphd) Dial(t int) error {
 		return nil
 	}
 
-	// If no valid connection is acuired, return error
+	// If no valid connection is acquired, return error
 	errStr := fmt.Sprintf("failed to connect to any URL in %v", g.urls)
 	g.LogErr(errStr)
 	return errors.New(errStr)
@@ -150,20 +171,24 @@ func (g *graphd) Dial(t int) error {
 // returned.  On failure, an error is returned.  Regardless if the connection was properly closed,
 // the connection is zeroed out.
 func (g *graphd) Disconnect() error {
+	// Only one thread at a time allowed to disconnect.
+	g.conn.Lock()
+	defer g.conn.Unlock()
+
 	// If not connected, return success.
-	if !g.isConnected() {
+	if !g.conn.existsConnection() {
 		g.LogDebug("no connection present")
 		return nil
 	}
 
 	// Zero out the connection on function exit.
-	defer func() { g.conn = nil }()
+	defer func() { g.conn.netConn = nil }()
 
 	// Retain address for logs.
-	connectedToAddr := g.conn.RemoteAddr()
+	connectedToAddr := g.conn.netConn.RemoteAddr()
 
 	// Try to close the existing connection.
-	err := g.conn.Close()
+	err := g.conn.netConn.Close()
 	if err != nil {
 		errStr := fmt.Sprintf("failed to close existing connection, resource leak: %v", err)
 		g.LogErr(errStr)
