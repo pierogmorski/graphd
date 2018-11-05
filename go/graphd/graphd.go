@@ -15,15 +15,16 @@ package graphd
 
 import (
 	"log/syslog"
-	"net"
 	"net/url"
 )
 
 // The interface to a running graphdb instance.
 type graphd struct {
 	logger *graphdLogger
-	urls   []*url.URL // URLS to connect to.
-	conn   net.Conn   // Acquired connection.
+	urls   []*url.URL  // URLS to connect to.
+	conn   *connection // Acquired connection.
+	reqQ   *requestQueue
+	resQ   *responseQueue
 }
 
 // New returns a populated graphdb struct pointer.
@@ -35,6 +36,16 @@ func New(l Logger, logLevel syslog.Priority, urlStrs []string) *graphd {
 	g := &graphd{}
 
 	g.initLogger(l, logLevel)
+
+	// Prime connection.
+	g.conn = primeConnection()
+
+	// Spool up a writer.
+	go g.write()
+
+	// Initialize request and response queues.
+	g.reqQ = &requestQueue{}
+	g.resQ = &responseQueue{}
 
 	if err := g.initURLs(urlStrs); err != nil {
 		g.LogFatalf("failed to initialize URLs: %v", err)
