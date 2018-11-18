@@ -17,29 +17,51 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"strings"
 )
 
-// readReponse returns a Response pointer read from an established connection to a graphd database
-// and a nil error on success.  On failure, a zero-value Response pointer and error are returned.
-// readResponse must be called with g.conn locked.
-func (g *graphd) readResponse() (*Response, error) {
+// readReponses returns a Response pointer slice read from an established connection to a graphd
+// database and a nil error on success.  On any failure to read a response, a Response pointer
+// slice containing zero-value Response pointers for the given failures, and the last encountered
+// error are returned.  readResponses must be called with g.conn locked.
+// TODO: Would it be useful to return all encountered errors?  Any chance after a failure that
+//       we'll block on the following call to ReadString()?
+func (g *graphd) readResponses(reqsNum int) ([]*Response, error) {
+	var retErr error
+	var resSlice []*Response
+
 	reader := bufio.NewReader(g.conn.netConn)
-	str, err := reader.ReadString('\n')
-	if err != nil {
-		return NewResponse(""), err
+
+	for i := 0; i < reqsNum; i++ {
+		str, err := reader.ReadString('\n')
+		if err != nil {
+			resSlice = append(resSlice, NewResponse(""))
+			retErr = err
+		} else {
+			resSlice = append(resSlice, NewResponse(str))
+		}
 	}
-	return NewResponse(strings.Trim(str, "\n")), err
+
+	return resSlice, retErr
 }
 
 // Query attempts to send the Request to the graphd database to which this instance of the library
-// is connected.  If no connection is currently present, or if the established connection is stale,
-// Query will trigger a Redial.  On success, a Response pointer containing a response from the
-// graphd database is returned along with a nil error.  On failure, a zero-value Response pointer is
-// returned along with an error.  Query locks the connection, allowing only one thread to Query at a
-// time.
-func (g *graphd) Query(req *Request) (*Response, error) {
+// is connected.  In the case of more than one Request, the requests are joined and sent as one.
+// If no connection is currently present, or if the established connection is stale, Query will
+// trigger a Redial.  On success, a Response pointer slice containing responses from the graphd
+// database is returned along with a nil error.  On failure, a Response pointer slice containing a
+// zero-value Response pointer is returned along with an error.  Query locks the connection, allowing
+// only one thread to Query at a time.
+func (g *graphd) Query(reqs ...*Request) ([]*Response, error) {
 	g.conn.Lock()
+
+	// Join requests into one if needed.
+	var req *Request
+	reqsNum := len(reqs)
+	if reqsNum > 1 {
+		req = joinRequests(reqs...)
+	} else {
+		req = reqs[0]
+	}
 
 	g.LogDebugf("attempting to send '%v'", req)
 
@@ -53,7 +75,7 @@ func (g *graphd) Query(req *Request) (*Response, error) {
 		// An established connection is present, try to send.
 		case true:
 			// Queries to graphd are new line termianted.
-			_, err = fmt.Fprintf(g.conn.netConn, "%v\n", req)
+			_, err = fmt.Fprintf(g.conn.netConn, "%v", req.body)
 			if err != nil {
 				// Set base error for failed send.
 				errStr = fmt.Sprintf("failed to send '%v': %v", req, err)
@@ -62,7 +84,7 @@ func (g *graphd) Query(req *Request) (*Response, error) {
 				if retries == 0 {
 					g.LogErr(errStr)
 					g.conn.Unlock()
-					return NewResponse(""), errors.New(errStr)
+					return []*Response{NewResponse("")}, errors.New(errStr)
 				}
 				// We can still retry, so try a Redial.  If it fails, append the error message to
 				// the base error, log and return the error.
@@ -71,7 +93,7 @@ func (g *graphd) Query(req *Request) (*Response, error) {
 				if err != nil {
 					errStr = fmt.Sprintf("%v: %v", errStr, err)
 					g.LogErr(errStr)
-					return NewResponse(""), errors.New(errStr)
+					return []*Response{NewResponse("")}, errors.New(errStr)
 				}
 				// OK, we've redialed.  Lock the connection and let's try that send again.
 				g.conn.Lock()
@@ -89,20 +111,20 @@ func (g *graphd) Query(req *Request) (*Response, error) {
 			if err != nil {
 				errStr = fmt.Sprintf("failed to send '%v': %v", req, err)
 				g.LogErr(errStr)
-				return NewResponse(""), errors.New(errStr)
+				return []*Response{NewResponse("")}, errors.New(errStr)
 			}
 			g.conn.Lock()
 		}
 	}
 
-	// We've successfully sent a query, now grab the response and return it.
-	res, err := g.readResponse()
+	// We've successfully sent a query, now grab the responses and return them.
+	res, err := g.readResponses(reqsNum)
 	if err != nil {
 		errStr := fmt.Sprintf("failed to receive response to '%v': %v", req, err)
 		g.LogErr(errStr)
 		err = errors.New(errStr)
 	} else {
-		g.LogDebugf("received response '%v' to query '%v'", res, req)
+		g.LogDebugf("received response '%v'", res)
 	}
 	g.conn.Unlock()
 	return res, err

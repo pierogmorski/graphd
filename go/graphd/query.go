@@ -14,6 +14,10 @@
 
 package graphd
 
+import (
+	"strings"
+)
+
 // A Request to be sent to a graphd database.
 // Currently this is just a wrapper around a string.
 type Request struct {
@@ -22,7 +26,7 @@ type Request struct {
 
 // String implements stringer interface for a Request.
 func (r *Request) String() string {
-	return r.body
+	return strings.TrimSpace(r.body)
 }
 
 // A Response received from a graphd database.
@@ -33,14 +37,33 @@ type Response struct {
 
 // String implements stringer interface for a Response.
 func (r *Response) String() string {
-	return r.body
+	return strings.TrimSpace(r.body)
 }
 
 // NewRequest returns a Request pointer initialized from the string parameter.  The parameter should
-// represent one request to be sent to a graphd database.  Stringing together multiple requests is
-// not currently supported.
+// represent one request to be sent to a graphd database.  A new line is automatically added.
 func NewRequest(s string) *Request {
-	return &Request{s}
+	var reqSB strings.Builder
+
+	reqSB.WriteString(s)
+
+	if strings.LastIndexByte(s, '\n') != len(s) {
+		reqSB.WriteString("\n")
+	}
+
+	return &Request{reqSB.String()}
+}
+
+// joinRequests is used to fuse multiple Requests into a single, new line delimited request.  The
+// joined Request is returned.
+func joinRequests(reqs ...*Request) *Request {
+	var reqSB strings.Builder
+
+	for _, req := range reqs {
+		reqSB.WriteString(req.body)
+	}
+
+	return &Request{reqSB.String()}
 }
 
 // NewResponse returns a Response pointer initialized from the string parameter.  The parameter
